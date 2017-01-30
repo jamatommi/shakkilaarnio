@@ -6,6 +6,8 @@ import re, sys, time
 from itertools import count
 from collections import OrderedDict, namedtuple
 
+import random, math
+
 # The table size is the maximum number of elements in the transposition table.
 TABLE_SIZE = 1e8
 
@@ -16,6 +18,11 @@ TABLE_SIZE = 1e8
 # E.g. Mate in 3 will be MATE_UPPER - 6
 MATE_LOWER = 60000 - 8*2700
 MATE_UPPER = 60000 + 8*2700
+
+#for transposition table node types
+EXACT = 0
+ALPHA = 1
+BETA = 2
 
 QS_LIMIT = 150
 EVAL_ROUGHNESS = 20
@@ -38,8 +45,37 @@ initial = (
     '         \n'  # 110 -119
 )
 
+'''initial = (
+    '         \n'  #   0 -  9
+    '         \n'  #  10 - 19
+    ' ..r...k.\n'  #  20 - 29
+    ' ....R.p.\n'  #  30 - 39
+    ' ...r....\n'  #  40 - 49
+    ' ...p..Np\n'  #  50 - 59
+    ' .......P\n'  #  60 - 69
+    ' ..P.....\n'  #  70 - 79
+    ' P.......\n'  #  80 - 89
+    ' R......K\n'  #  90 - 99
+    '         \n'  # 100 -109
+    '         \n'  # 110 -119
+)'''
+'''initial = (
+    '         \n'  #   0 -  9
+    '         \n'  #  10 - 19
+    ' ..r...k.\n'  #  20 - 29
+    ' ....Rppp\n'  #  30 - 39
+    ' ...r....\n'  #  40 - 49
+    ' ........\n'  #  50 - 59
+    ' ........\n'  #  60 - 69
+    ' ...P....\n'  #  70 - 79
+    ' ........\n'  #  80 - 89
+    ' R......K\n'  #  90 - 99
+    '         \n'  # 100 -109
+    '         \n'  # 110 -119
+)'''
+
 ###############################################################################
-# Move and evaluation tables
+# M'''ove and evaluation tables
 ###############################################################################
 
 N, E, S, W = -10, 1, 10, -1
@@ -80,7 +116,7 @@ pst = {
     'N': (0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         0, 627, 762, 786, 798, 798, 786, 762, 627, 0,
-        0, 763, 798, 822, 834, 834, 822, 798, 763, 0,
+        0, 763, 798, 822, 83, 834, 822, 798, 763, 0,
         0, 817, 852, 876, 888, 888, 876, 852, 817, 0,
         0, 797, 832, 856, 868, 868, 856, 832, 797, 0,
         0, 799, 834, 858, 870, 870, 858, 834, 799, 0,
@@ -240,7 +276,7 @@ class Position(namedtuple('Position', 'board score wc bc ep kp')):
 ###############################################################################
 
 # lower <= s(pos) <= upper
-Entry = namedtuple('Entry', 'lower upper')
+Entry = namedtuple('Entry', 'depth flag score')
 
 # The normal OrderedDict doesn't update the position of a key in the list,
 # when the value is changed.
@@ -249,6 +285,7 @@ class LRUCache:
     def __init__(self, size):
         self.od = OrderedDict()
         self.size = size
+        self._searched_nodes = 0
 
     def get(self, key, default=None):
         try: self.od.move_to_end(key)
@@ -266,125 +303,124 @@ class Searcher:
     def __init__(self):
         self.tp_score = LRUCache(TABLE_SIZE)
         self.tp_move = LRUCache(TABLE_SIZE)
+        #self.ttable = LRUCache(TABLE_SIZE)
         self.nodes = 0
+        self.threshold = 0.001
+        self._control = 3
+        self._starttime = 0
+    def search_negamax(self, pos, min_depth=0):
+        #assuming playing black
+        best_val = float('-inf')
+        best_move = None
+        prev_best = None
+        moves = sorted(pos.gen_moves(), key=pos.value, reverse=True)
 
-    def bound(self, pos, gamma, depth, root=True):
-        """ returns r where
-                s(pos) <= r < gamma    if gamma > s(pos)
-                gamma <= r <= s(pos)   if gamma <= s(pos)"""
-        self.nodes += 1
+        self._searched_nodes = 0
+        self._starttime = time.time()
 
-        # Depth <= 0 is QSearch. Here any position is searched as deeply as is needed for calmness, and so there is no reason to keep different depths in the transposition table.
-        depth = max(depth, 0)
+        control = self._control
+        
+        best_moves = []
 
-        # Sunfish is a king-capture engine, so we should always check if we
-        # still have a king. Notice since this is the only termination check,
-        # the remaining code has to be comfortable with being mated, stalemated
-        # or able to capture the opponent king.
-        if pos.score <= -MATE_LOWER:
-            return -MATE_UPPER
+        for d in range(1, 1000):
+            best_val = float('-inf')
+            best_move = None 
 
-        # Look in the table if we have already searched this position before.
-        # We also need to be sure, that the stored search was over the same
-        # nodes as the current search.
-        entry = self.tp_score.get((pos, depth, root), Entry(-MATE_UPPER, MATE_UPPER))
-        if entry.lower >= gamma and (not root or self.tp_move.get(pos) is not None):
-            return entry.lower
-        if entry.upper < gamma:
-            return entry.upper
+            if time.time() - self._starttime > self._control and d >= min_depth:
+                print ("searched nodes: " + str(self._searched_nodes) + " depth: " + str(d))
+                print(str(time.time() - self._starttime)) 
 
-        # Here extensions may be added
-        # Such as 'if in_check: depth += 1'
+                if len(best_moves):
+                    final = best_moves.pop() 
+                    return best_val, final
+                else:
+                    return best_val, best_move
 
-        # Generator of moves to search in order.
-        # This allows us to define the moves, but only calculate them if needed.
-        def moves():
-            # First try not moving at all
-            if depth > 0 and not root and any(c in pos.board for c in 'RBNQ'):
-                yield None, -self.bound(pos.nullmove(), 1-gamma, depth-3, root=False)
-            # For QSearch we have a different kind of null-move
-            if depth == 0:
-                yield None, pos.score
-            # Then killer move. We search it twice, but the tp will fix things for us. Note, we don't have to check for legality, since we've already done it before. Also note that in QS the killer must be a capture, otherwise we will be non deterministic.
-            killer = self.tp_move.get(pos)
-            if killer and (depth > 0 or pos.value(killer) >= QS_LIMIT):
-                yield killer, -self.bound(pos.move(killer), 1-gamma, depth-1, root=False)
-            # Then all the other moves
-            for move in sorted(pos.gen_moves(), key=pos.value, reverse=True):
-                if depth > 0 or pos.value(move) >= QS_LIMIT:
-                    yield move, -self.bound(pos.move(move), 1-gamma, depth-1, root=False)
+            for move in moves:
+                value = -self._search_negamax(pos.move(move), d, float('-inf'), float('inf'), 1)
 
-        # Run through the moves, shortcutting when possible
-        best = -MATE_UPPER
-        for move, score in moves():
-            best = max(best, score)
-            if best >= gamma:
-                # Save the move for pv construction and killer heuristic
-                self.tp_move[pos] = move
-                break
-
-        # Stalemate checking is a bit tricky: Say we failed low, because
-        # we can't (legally) move and so the (real) score is -infty.
-        # At the next depth we are allowed to just return r, -infty <= r < gamma,
-        # which is normally fine.
-        # However, what if gamma = -10 and we don't have any legal moves?
-        # Then the score is actaully a draw and we should fail high!
-        # Thus, if best < gamma and best < 0 we need to double check what we are doing.
-        # This doesn't prevent sunfish from making a move that results in stalemate,
-        # but only if depth == 1, so that's probably fair enough.
-        # (Btw, at depth 1 we can also mate without realizing.)
-        if best < gamma and best < 0 and depth > 0:
-            is_dead = lambda pos: any(pos.value(m) >= MATE_LOWER for m in pos.gen_moves())
-            if all(is_dead(pos.move(m)) for m in pos.gen_moves()):
-                in_check = is_dead(pos.nullmove())
-                best = -MATE_UPPER if in_check else 0
-
-        # Table part 2
-        if best >= gamma:
-            self.tp_score[(pos, depth, root)] = Entry(best, entry.upper)
-        if best < gamma:
-            self.tp_score[(pos, depth, root)] = Entry(entry.lower, best)
-
-        return best
-
-    # secs over maxn is a breaking change. Can we do this?
-    # I guess I could send a pull request to deep pink
-    # Why include secs at all?
-    def _search(self, pos):
-        """ Iterative deepening MTD-bi search """
-        self.nodes = 0
-
-        # In finished games, we could potentially go far enough to cause a recursion
-        # limit exception. Hence we bound the ply.
-        for depth in range(1, 1000):
-            self.depth = depth
-            # The inner loop is a binary search on the score of the position.
-            # Inv: lower <= score <= upper
-            # 'while lower != upper' would work, but play tests show a margin of 20 plays better.
-            lower, upper = -MATE_UPPER, MATE_UPPER
-            while lower < upper - EVAL_ROUGHNESS:
-                gamma = (lower+upper+1)//2
-                score = self.bound(pos, gamma, depth)
-                if score >= gamma:
-                    lower = score
-                if score < gamma:
-                    upper = score
-            # We want to make sure the move to play hasn't been kicked out of the table,
-            # So we make another call that must always fail high and thus produce a move.
-            score = self.bound(pos, lower, depth)
-
-            # Yield so the user may inspect the search
-            yield
-
+                if value > best_val:
+                    best_val = value
+                    best_move = move
+            if not best_move in best_moves:
+                best_moves.append(best_move)    
+            #print(d)
+        return best_val, best_moves.pop()
     def search(self, pos, secs):
-        start = time.time()
-        for _ in self._search(pos):
-            if time.time() - start > secs:
-                break
-        # If the game hasn't finished we can retrieve our move from the
-        # transposition table.
-        return self.tp_move.get(pos), self.tp_score.get((pos, self.depth, True)).lower
+        self._control = secs
+        score, move = self.search_negamax(pos)
+        return move,score
 
+
+    def _search_negamax(self, pos, depth, alpha, beta, color, q_search = False):
+        self._searched_nodes += 1
+
+        if pos.score <=-MATE_LOWER:
+            return -MATE_UPPER
+        if (depth < 1 and not q_search) or time.time() - self._starttime > self._control*10:
+                return pos.score
+
+        ttEntry = self.tp_score.get((pos, depth))
+        if ttEntry:
+            if ttEntry.flag == EXACT:
+                return ttEntry.score
+            elif ttEntry.flag == ALPHA:
+                alpha = max(alpha, ttEntry.score)
+            elif ttEntry.flag == BETA:
+                beta = min(beta, ttEntry.score)
+
+            if alpha >= beta:
+                return ttEntry.score
+        
+        orig_alpha = alpha
+        
+        #moves = sorted(pos.gen_moves(), key=pos.value, reverse=True)
+
+        qs = False
+
+        def moves():
+            #nullmove
+            if any(c in pos.board for c in 'RBNQ'):
+                yield None, -self._search_negamax(pos.nullmove(), depth-3, -beta, -alpha, -color, False)
+            #killer
+            killer = self.tp_move.get(pos)
+            if killer:
+                yield killer, -self._search_negamax(pos.move(killer), depth-1, -beta, -alpha, -color, False)
+                
+            for move in sorted(pos.gen_moves(), key=pos.value, reverse=True):
+                if pos.value(move) > QS_LIMIT:
+                    qs = True
+                else:
+                    qs = False                
+                yield move, -self._search_negamax(pos.move(move), depth-1, -beta, -alpha, -color, qs)
+        
+        best_val = float('-inf')
+        best_move = None
+        for move, score in moves():
+            if score > best_val:
+                best_val = score
+                best_move = move
+
+            alpha = max(alpha, score)
+            if alpha > beta:
+                break            
+        #print(str(depth) + "/" + str(best_move) + "/" + str(move))
+
+
+        e_score = best_val
+        if best_val <= orig_alpha:
+            e_flag = BETA
+        elif best_val >= beta:
+            e_flag = ALPHA
+        else:
+            e_flag = EXACT
+
+        e_depth = depth
+
+        self.tp_score[(pos, depth)] = Entry(e_depth, e_flag, e_score)
+        self.tp_move[pos] = best_move
+
+        return best_val
 
 ###############################################################################
 # User interface
@@ -449,7 +485,7 @@ def main():
             break
 
         # Fire up the engine to look for a move.
-        move, score = searcher.search(pos, secs=2)
+        score, move= searcher.search_negamax(pos)
 
         if score == MATE_UPPER:
             print("Checkmate!")
